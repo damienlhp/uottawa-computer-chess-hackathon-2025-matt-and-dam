@@ -1,231 +1,165 @@
-"""
-Some example classes for people who want to create a homemade bot.
-
-With these classes, bot makers will not have to implement the UCI or XBoard interfaces themselves.
-"""
+import time
+import random
 import chess
 from chess.engine import PlayResult, Limit
-import random
 from lib.engine_wrapper import MinimalEngine
-from lib.lichess_types import MOVE, HOMEMADE_ARGS_TYPE
-import logging
+
+print('chess bot version 6.0')
+
+PIECE_VALUES = {
+    chess.PAWN: 100,
+    chess.KNIGHT: 320,
+    chess.BISHOP: 330,
+    chess.ROOK: 500,
+    chess.QUEEN: 900,
+    chess.KING: 20000
+}
+
+INFINITY = 10**9
 
 
-# Use this logger variable to print messages to the console or log files.
-# logger.info("message") will always print "message" to the console or log file.
-# logger.debug("message") will only print "message" if verbose logging is enabled.
-logger = logging.getLogger(__name__)
+class StrongBot(MinimalEngine):
+    """Fast version: consistent <2s per move, shallow but smart.
+
+    Accept the same constructor signature as `MinimalEngine` so the
+    engine factory can instantiate this class with kwargs like `cwd`.
+    """
+
+    def __init__(self, commands=None, options=None, stderr=None, draw_or_resign=None,
+                 game=None, name=None, **popen_args):
+        # Forward parameters to MinimalEngine which will create a FillerEngine
+        # for homemade engines. Keep local engine data structures after init.
+        super().__init__(commands, options, stderr, draw_or_resign, game, name=name, **popen_args)
+        self.tt = {}
+        self.history = {}
+        self.killers = {}
+
+    def evaluate(self, b: chess.Board) -> int:
+        """Simple but quick evaluation (material + basic king safety)."""
+        if b.is_game_over():
+            outcome = b.outcome()
+            if outcome is None or outcome.winner is None:
+                return 0
+            return INFINITY if outcome.winner == chess.WHITE else -INFINITY
+
+        score = 0
+        for piece_type, val in PIECE_VALUES.items():
+            score += val * (len(b.pieces(piece_type, chess.WHITE)) -
+                            len(b.pieces(piece_type, chess.BLACK)))
+
+        # Small king safety term (avoid checks)
+        if b.is_check():
+            score += -50 if b.turn == chess.WHITE else 50
+
+        return score
+
+    def search(self, board: chess.Board, *args) -> PlayResult:
+        """Main search — tuned for fast, consistent response."""
+        # --- time control: never exceed 1.5–2s per move ---
+        time_limit = args[0] if (args and isinstance(args[0], Limit)) else None
+        max_time = 1.2
+        if isinstance(time_limit, Limit) and isinstance(time_limit.time, (int, float)):
+            # adapt a little, but stay fast
+            max_time = max(0.8, min(1.8, time_limit.time / 60.0))
+
+        start = time.time()
+        deadline = start + max_time
+
+        def time_up():
+            return time.time() >= deadline
+
+        def quiescence(b, alpha, beta):
+            """Capture-only extension."""
+            stand_pat = self.evaluate(b)
+            if stand_pat >= beta:
+                return beta
+            if alpha < stand_pat:
+                alpha = stand_pat
+
+            for m in b.legal_moves:
+                if not b.is_capture(m):
+                    continue
+                if time_up():
+                    break
+                b.push(m)
+                score = -quiescence(b, -beta, -alpha)
+                b.pop()
+                if score >= beta:
+                    return beta
+                if score > alpha:
+                    alpha = score
+            return alpha
+
+        def alphabeta(b, depth, alpha, beta):
+            if depth == 0 or time_up():
+                return quiescence(b, alpha, beta)
+
+            best_val = -INFINITY
+            for m in b.legal_moves:
+                b.push(m)
+                val = -alphabeta(b, depth - 1, -beta, -alpha)
+                b.pop()
+
+                if val > best_val:
+                    best_val = val
+                if best_val > alpha:
+                    alpha = best_val
+                if alpha >= beta or time_up():
+                    break
+            return best_val
+
+        # --- fast iterative deepening but capped at depth 3 ---
+        best_move = random.choice(list(board.legal_moves))
+        best_score = -INFINITY
+        for depth in range(1, 4):  # fixed shallow depth
+            if time_up():
+                break
+            current_best = None
+            current_best_score = -INFINITY
+            for m in board.legal_moves:
+                if time_up():
+                    break
+                board.push(m)
+                val = -alphabeta(board, depth - 1, -INFINITY, INFINITY)
+                board.pop()
+                if val > current_best_score:
+                    current_best_score = val
+                    current_best = m
+            if current_best:
+                best_move, best_score = current_best, current_best_score
+
+        # --- emergency fallback if time is up ---
+        if time_up():
+            legal = list(board.legal_moves)
+            safe = [m for m in legal if not board.gives_check(m)]
+            if safe:
+                best_move = random.choice(safe)
+            else:
+                best_move = random.choice(legal)
+
+        print(f"🕐 Fast move made in {time.time() - start:.2f}s")
+        return PlayResult(best_move, None)
 
 
 class ExampleEngine(MinimalEngine):
-    """An example engine that all homemade engines inherit."""
+    """Backward-compatible example engine used by tests.
 
-
-# Bot names and ideas from tom7's excellent eloWorld video
-
-class RandomMove(ExampleEngine):
-    """Get a random move."""
-
-    def search(self, board: chess.Board, *args: HOMEMADE_ARGS_TYPE) -> PlayResult:  # noqa: ARG002
-        """Choose a random move."""
-        return PlayResult(random.choice(list(board.legal_moves)), None)
-
-
-class Alphabetical(ExampleEngine):
-    """Get the first move when sorted by san representation."""
-
-    def search(self, board: chess.Board, *args: HOMEMADE_ARGS_TYPE) -> PlayResult:  # noqa: ARG002
-        """Choose the first move alphabetically."""
-        moves = list(board.legal_moves)
-        moves.sort(key=board.san)
-        return PlayResult(moves[0], None)
-
-
-class FirstMove(ExampleEngine):
-    """Get the first move when sorted by uci representation."""
-
-    def search(self, board: chess.Board, *args: HOMEMADE_ARGS_TYPE) -> PlayResult:  # noqa: ARG002
-        """Choose the first move alphabetically in uci representation."""
-        moves = list(board.legal_moves)
-        moves.sort(key=str)
-        return PlayResult(moves[0], None)
-
-
-class ComboEngine(ExampleEngine):
-    """
-    Get a move using multiple different methods.
-
-    This engine demonstrates how one can use `time_limit`, `draw_offered`, and `root_moves`.
+    Provides a simple constructor matching the engine factory expectations
+    and a trivial `search` implementation that returns a legal move.
     """
 
-    def search(self,
-               board: chess.Board,
-               time_limit: Limit,
-               ponder: bool,  # noqa: ARG002
-               draw_offered: bool,
-               root_moves: MOVE) -> PlayResult:
-        """
-        Choose a move using multiple different methods.
+    def __init__(self, commands, options, stderr, draw_or_resign, game=None, **popen_args):
+        # MinimalEngine expects (commands, options, stderr, draw_or_resign, game=None, name=None, **popen_args)
+        # We forward parameters and let the wrapper provide a FillerEngine.
+        super().__init__(commands, options, stderr, draw_or_resign, game, **popen_args)
 
-        :param board: The current position.
-        :param time_limit: Conditions for how long the engine can search (e.g. we have 10 seconds and search up to depth 10).
-        :param ponder: Whether the engine can ponder after playing a move.
-        :param draw_offered: Whether the bot was offered a draw.
-        :param root_moves: If it is a list, the engine should only play a move that is in `root_moves`.
-        :return: The move to play.
-        """
-        if isinstance(time_limit.time, int):
-            my_time = time_limit.time
-            my_inc = 0
-        elif board.turn == chess.WHITE:
-            my_time = time_limit.white_clock if isinstance(time_limit.white_clock, int) else 0
-            my_inc = time_limit.white_inc if isinstance(time_limit.white_inc, int) else 0
-        else:
-            my_time = time_limit.black_clock if isinstance(time_limit.black_clock, int) else 0
-            my_inc = time_limit.black_inc if isinstance(time_limit.black_inc, int) else 0
+    def search(self, board: chess.Board, time_limit: Limit, ponder: bool, draw_offered: bool, root_moves):
+        # Return the first legal move if available, else None.
+        mv = next(board.legal_moves, None)
+        return self.offer_draw_or_resign(PlayResult(mv, None), board)
 
-        possible_moves = root_moves if isinstance(root_moves, list) else list(board.legal_moves)
 
-        if my_time / 60 + my_inc > 10:
-            # Choose a random move.
-            move = random.choice(possible_moves)
-        else:
-            # Choose the first move alphabetically in uci representation.
-            possible_moves.sort(key=str)
-            move = possible_moves[0]
-        return PlayResult(move, None, draw_offered=draw_offered)
-
-    
-class MyBot(ExampleEngine):
-    """Template code for hackathon participants to modify.
-
-    This is intentionally a very small, simple, and weak example engine
-    meant for learning and quick prototyping only.
-
-    Key limitations:
-    - Fixed-depth search with only a very naive time-to-depth mapping (no true time management).
-    - Plain minimax: no alpha-beta pruning, so the search is much slower than it
-      could be for the same depth.
-    - No iterative deepening: the engine does not progressively deepen and use PV-based ordering.
-    - No move ordering or capture heuristics: moves are searched in arbitrary order.
-    - No transposition table or caching: repeated positions are re-searched.
-    - Evaluation is material-only and very simplistic; positional factors are ignored.
-
-    Use this as a starting point: replace minimax with alpha-beta, add
-    iterative deepening, quiescence search, move ordering (MVV/LVA, history),
-    transposition table, and a richer evaluator to make it competitive.
-    """
-
-    def search(self, board: chess.Board, *args: HOMEMADE_ARGS_TYPE) -> PlayResult:
-        # NOTE: The sections below are intentionally simple to keep the example short.
-        # They demonstrate the structure of a search but also highlight the engine's
-        # weaknesses (fixed depth, naive time handling, no pruning, no quiescence, etc.).
-
-        # --- very simple time-based depth selection (naive) ---
-        # Expect args to be (time_limit: Limit, ponder: bool, draw_offered: bool, root_moves: MOVE)
-        time_limit = args[0] if (args and isinstance(args[0], Limit)) else None
-        my_time = my_inc = None
-        if time_limit is not None:
-            if isinstance(time_limit.time, (int, float)):
-                my_time = time_limit.time
-                my_inc = 0
-            elif board.turn == chess.WHITE:
-                my_time = time_limit.white_clock if isinstance(time_limit.white_clock, (int, float)) else 0
-                my_inc = time_limit.white_inc if isinstance(time_limit.white_inc, (int, float)) else 0
-            else:
-                my_time = time_limit.black_clock if isinstance(time_limit.black_clock, (int, float)) else 0
-                my_inc = time_limit.black_inc if isinstance(time_limit.black_inc, (int, float)) else 0
-
-        # Map a rough time budget to a coarse fixed depth.
-        # Examples:
-        # - >= 60s: depth 4
-        # - >= 20s: depth 3
-        # - >= 5s:  depth 2
-        # - else:   depth 1
-        remaining = my_time if isinstance(my_time, (int, float)) else None
-        inc = my_inc if isinstance(my_inc, (int, float)) else 0
-        budget = (remaining or 0) + 2 * inc  # crude increment bonus
-        if remaining is None:
-            total_depth = 4
-        elif budget >= 60:
-            total_depth = 4
-        elif budget >= 20:
-            total_depth = 3
-        elif budget >= 5:
-            total_depth = 2
-        else:
-            total_depth = 1
-        total_depth = max(1, int(total_depth))
-
-        # --- simple material evaluator (White-positive score) ---
-        def evaluate(b: chess.Board) -> int:
-            # Large score for terminal outcomes
-            if b.is_game_over():
-                outcome = b.outcome()
-                if outcome is None or outcome.winner is None:
-                    return 0  # draw
-                return 10_000_000 if outcome.winner is chess.WHITE else -10_000_000
-
-            values = {
-                chess.PAWN: 100,
-                chess.KNIGHT: 320,
-                chess.BISHOP: 330,
-                chess.ROOK: 500,
-                chess.QUEEN: 900,
-                chess.KING: 0,  # king material ignored (checkmates handled above)
-            }
-            score = 0
-            for pt, v in values.items():
-                score += v * (len(b.pieces(pt, chess.WHITE)) - len(b.pieces(pt, chess.BLACK)))
-            return score
-
-        # --- plain minimax (no alpha-beta) ---
-        def minimax(b: chess.Board, depth: int, maximizing: bool) -> int:
-            if depth == 0 or b.is_game_over():
-                return evaluate(b)
-
-            if maximizing:
-                best = -10**12
-                for m in b.legal_moves:
-                    b.push(m)
-                    val = minimax(b, depth - 1, False)
-                    b.pop()
-                    if val > best:
-                        best = val
-                return best
-            else:
-                best = 10**12
-                for m in b.legal_moves:
-                    b.push(m)
-                    val = minimax(b, depth - 1, True)
-                    b.pop()
-                    if val < best:
-                        best = val
-                return best
-
-        # --- root move selection ---
-        legal = list(board.legal_moves)
-        if not legal:
-            # Should not happen during normal play; fall back defensively
-            return PlayResult(random.choice(list(board.legal_moves)), None)
-
-        maximizing = board.turn == chess.WHITE
-        best_move = None
-        best_eval = -10**12 if maximizing else 10**12
-
-        # Lookahead depth chosen by the simple time heuristic; subtract one for the root move
-        for m in legal:
-            board.push(m)
-            val = minimax(board, total_depth - 1, not maximizing)
-            board.pop()
-
-            if maximizing and val > best_eval:
-                best_eval, best_move = val, m
-            elif not maximizing and val < best_eval:
-                best_eval, best_move = val, m
-
-        # Fallback in rare cases (shouldn't trigger)
-        if best_move is None:
-            best_move = legal[0]
-
-        return PlayResult(best_move, None)
+# Backwards compatibility: some configurations and tests expect a class named
+# `MyBot` in this module. Provide a simple alias so `get_homemade_engine("MyBot")`
+# and imports like `from homemade import MyBot` continue to work.
+MyBot = StrongBot
